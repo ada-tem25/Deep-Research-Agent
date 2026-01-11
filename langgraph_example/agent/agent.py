@@ -9,6 +9,7 @@ class AgentState(TypedDict):
 
 workflow = StateGraph(AgentState) # Create a new graph, then add to it the state
 
+
 #------------------ LLM Node -----------------
 from langchain_google_genai import ChatGoogleGenerativeAI
 
@@ -21,6 +22,7 @@ def _get_model():
 system_prompt = "You are such a nice helpful bot"
 
 def call_model(state):
+    print('state before llm call :', state)
     messages = state["messages"]
     
     # add the state to the default system message
@@ -29,8 +31,10 @@ def call_model(state):
     
     model = _get_model()
     response = model.invoke(full_messages)
+    print('llm response :', response)
     
     return {"messages": [response]}
+
 
 #---------------- Tools Node ---------------
 
@@ -50,9 +54,45 @@ def calendar_tool() -> str:
 all_tools = [weather_tool, calendar_tool]
 tool_node = ToolNode(all_tools)
 
+
 # --------------- Define Nodes -------------
 
 workflow.add_node("agent", call_model)
 workflow.add_node("tools", tool_node)
 
+# entry point
+workflow.set_entry_point("agent")
 
+
+# ------------- Define Edges ------------
+
+# connect tools back to agent
+workflow.add_edge("tools", "agent")
+
+from langgraph.graph import END
+
+# define the function that determines whether to continue or not
+def should_continue(state):
+    messages = state["messages"]
+    last_message = messages[-1]
+    # if there are no tool calls, then we finish
+    if not last_message.tool_calls: 
+        return "end"
+    # if there is, we continue
+    else:
+        print('tool_calls :', last_message.tool_calls)
+        return "continue"
+
+workflow.add_conditional_edges(
+    "agent",
+    should_continue,
+    {
+        "continue": "tools",
+        "end": END,
+    },
+)
+
+
+# ------------ Compile Workflow -----------
+
+graph = workflow.compile()

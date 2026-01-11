@@ -6,3 +6,5 @@ pydantic
 python-dotenv
 tiktoken
 requests
+langchain_google_genai
+langgraph-cli[inmem]
