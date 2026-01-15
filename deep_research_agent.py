@@ -1,18 +1,16 @@
 import os
 from datetime import datetime
-from langgraph.graph import StateGraph
-from langgraph.graph import add_messages
+from langgraph.graph import StateGraph, add_messages, START, END
+from langgraph.types import Send
 from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage, AIMessage
-from langgraph.graph import START, END
 from typing import TypedDict, Annotated, Sequence, List
 from pydantic import BaseModel, Field
 from langchain_google_genai import ChatGoogleGenerativeAI
 import operator
+from google.genai import Client
 from dotenv import load_dotenv
-load_dotenv()
-
-from prompts import (query_writer_instructions)
-from tools import get_research_topic
+from prompts import (query_writer_instructions, web_searcher_instructions)
+from utils import (get_research_topic, resolve_urls, get_citations, insert_citation_markers)
 
 
 
@@ -26,9 +24,15 @@ class OverallState(TypedDict): #All the fields that the state will keep in memor
     initial_search_query_count: int
     max_research_loops: int #limit of research loops
     research_loop_count: int #count of research loops
-    reasoning_model: str
+
 
 builder = StateGraph(OverallState) #create a graph, with the above state as its referred state
+
+load_dotenv() #We retrieve the API key and make sure it is well set
+if os.getenv("GOOGLE_API_KEY") is None: raise ValueError("GOOGLE_API_KEY is not set")
+
+# Used later for the Google Search API
+genai_client = Client(api_key=os.getenv("GOOGLE_API_KEY"))
 
 
 
@@ -64,11 +68,12 @@ def generate_query(state: OverallState) -> QueryGenerationState:
     Returns:
         Dictionary with state update, including the list of the generated queries
     """
+    print('> 1st node : Generate Query')
 
     #We configure the model
     llm = ChatGoogleGenerativeAI(
         model="gemini-2.0-flash",
-        temperature=1,
+        temperature=0.5,
         max_retries=2,
         api_key=os.getenv("GOOGLE_API_KEY"),
     )
@@ -77,12 +82,13 @@ def generate_query(state: OverallState) -> QueryGenerationState:
     #We adapt the prompt
     formatted_prompt = query_writer_instructions.format(
         current_date=datetime.now().strftime("%B %d, %Y"),
-        research_topic=get_research_topic(state["messages"]), #This function retrieves the AI and human messages from the conversation to understand the research topic
+        research_topic=get_research_topic(state["messages"]), #This function retrieves the AI and human messages from the conversation that form the research topic
         number_queries=state["initial_search_query_count"],
     )
 
     result = llm.invoke(formatted_prompt) #At this point, result is of format {queries: List(str), rationale: str} (like SearchQueries)
     queries = [Query(query=q, rationale=result.rationale) for q in result.queries]
+    print(f'--> {len(queries)} generated queries!')
     return {"queries": queries} #Returns a QueryGenerationState {queries: List(Query)} with Query being {query: str, rationale: str}
 
 builder.add_edge(START, "generate_query") #this node is the first one called
@@ -93,10 +99,21 @@ builder.add_node("generate_query", generate_query)
 #----------------- 1st conditional edge : parallel searches ----------
 
 def continue_to_web_research(state: QueryGenerationState):
-    # ...Some logic to send out multiple search queries...
-    return None
+    """
+        Routing function that sends the search queries to several instances of the web research node.
+    """
+    print(f'- run {len(state["queries"])} web researches in parallel')
+    
+    return [
+        Send( #Send allows to send states in parallel to several instances of the same node
+            "web_research", 
+            {"search_query": search_query, "id": int(idx)} #WebSearchState format, as required by the next node
+        )
+        for idx, search_query in enumerate(state["queries"])
+    ]
 
 builder.add_conditional_edges("generate_query", continue_to_web_research, ["web_research"])
+
 
 
 # ------------- 2nd node : Web Research ---------------
@@ -106,16 +123,68 @@ class WebSearchState(TypedDict):
     id: str
 
 def web_research(state: WebSearchState) -> OverallState:
-    # ...Some logic to performs web research...
-    return {
-        "search_query": [state["search_query"]], #Those are actual fields from the OverallState : the operators at the top define how they will be merged in the shared OverallState
-        #"web_research_result": [modified_text],
-        #"sources_gathered": sources_gathered,
+    """LangGraph node that performs web research using the native Google 
+       Search API tool.
+
+    Executes a web search using the native Google Search API tool in 
+    combination with Gemini 2.0 Flash.
+
+    Args:
+        state: Current graph state containing the search query and 
+               research loop count
+        config: Configuration for the runnable, including search API settings
+
+    Returns:
+        Dictionary with state update, including sources_gathered, 
+        research_loop_count, and web_research_results
+    """
+    print('> Web Research :', state["search_query"].query)
+    
+    #We adapt the prompt
+    formatted_prompt = web_searcher_instructions.format(
+        current_date=datetime.now().strftime("%B %d, %Y"),
+        research_topic=state["search_query"]
+    )
+
+    #In contrary to .invoke(), here the LLM "possesses" the Google Search tool and understands that it can use the tool to fulfill the prompt.
+    response = genai_client.models.generate_content(
+        model="gemini-2.0-flash",
+        contents=formatted_prompt,
+        config={
+            "tools": [{"google_search": {}}], #A key benefit of this native integration is the grounding_metadata (urls, sources etc) returned with the response.
+            "temperature": 0,
+        },
+    )
+
+    #The following functions are a bit complicated : they all aim to format in the expected way the raw outputs from the LLM, with sources, urls etc. 
+
+    #resolve the urls to short urls for saving tokens and time --> It creates a mapping between long urls and their clean short counterparts
+    resolved_urls = resolve_urls(
+        response.candidates[0].grounding_metadata.grounding_chunks, #This is a list of long ugly urls
+        state["id"]
+    )
+
+    #gets the citations from the responses
+    citations = get_citations(response, resolved_urls)
+    
+    #adds them to the generated recap text
+    modified_text = insert_citation_markers(response.text, citations)
+
+    #formats the citations as sources
+    sources_gathered = [item for citation in citations for item in citation["segments"]]
+
+    return { #Those are actual fields from the OverallState : the operators at the top define how they will be merged in the shared OverallState
+        "search_query": [state["search_query"]], #{search_query: str, rationale: str}
+        "web_research_result": [modified_text], #list of informations (str), each info containing its shortened url and website at the end
+        "sources_gathered": sources_gathered, #list of {label: str (=website), short_url: str, value: str (=long url)} --> Will be used at the end to re obtain the long urls from the short ones of web_research_result
     }
 
-# Reflect on the web research
+
+#The next step will be to reflect on the web research
 builder.add_node("web_research", web_research)
 builder.add_edge("web_research", "reflection")
+
+
 
 # ------------- 3rd node : Reflection ---------------
 
@@ -128,6 +197,8 @@ class ReflectionState(TypedDict):
 
 def reflection(state: OverallState) -> ReflectionState:
     # ...Some logic to reflect on the results...
+    
+    print('> Reflection node. Entry OverallState =', state)
     result = {}
     return {
         "is_sufficient": result.is_sufficient,
@@ -140,6 +211,7 @@ def reflection(state: OverallState) -> ReflectionState:
 builder.add_node("reflection", reflection)
 
 
+
 #----------------- 2nd conditional edge : is context sufficient? ----------
 
 def evaluate_research(state: ReflectionState) -> OverallState:
@@ -147,6 +219,7 @@ def evaluate_research(state: ReflectionState) -> OverallState:
     return None
 
 builder.add_conditional_edges("reflection", evaluate_research, ["web_research", "finalize_answer"])
+
 
 
 # ----------------- 4th node : Finalizing Answer ------------------
@@ -164,6 +237,7 @@ def finalize_answer(state: OverallState) -> OverallState:
 builder.add_node("finalize_answer", finalize_answer)
 
 
+
 # ----------------- Graph End ------------------
 
 builder.add_edge("finalize_answer", END)
@@ -172,6 +246,21 @@ graph = builder.compile(name="deep-research-agent")
 
 
 
+if __name__ == "__main__":
+    #graph.get_graph(xray=True).draw_mermaid_png(output_file_path='./agent_graph.png')
+
+    messages = [HumanMessage(content="What are the latest developments in quantum mechanics?")]
+    result = graph.invoke({"messages": messages,
+        "search_query": [],
+        "web_research_result": [],
+        "sources_gathered": [],
+        "initial_search_query_count": 0,
+        "max_research_loops": 2,
+        "research_loop_count": 0
+    })
+
+    for m in result["messages"]:
+        m.pretty_print()
 
 
 
