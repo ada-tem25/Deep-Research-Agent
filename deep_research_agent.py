@@ -9,7 +9,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 import operator
 from google.genai import Client
 from dotenv import load_dotenv
-from prompts import (query_writer_instructions, web_searcher_instructions)
+from prompts import (query_writer_instructions, web_searcher_instructions, reflection_instructions)
 from utils import (get_research_topic, resolve_urls, get_citations, insert_citation_markers)
 
 
@@ -46,16 +46,16 @@ class Query(BaseModel):
         description="A brief explanation of why these queries are relevant to the research topic." #It allows to audit the behaviour of the agent
     )
 
-class SearchQueries(BaseModel):
+class QueryGenerationState(TypedDict): #the ouput node-specific state
+    queries: list[Query]
+
+class SearchQueries(BaseModel): #used to force the structure of the LLM output
     queries: list[str] = Field(
         description="A list of search queries to be used for web research."
     )
     rationale: str = Field(
         description="A brief explanation of why these queries are relevant to the research topic."
     )
-
-class QueryGenerationState(TypedDict): #the ouput node-specific state
-    queries: list[Query]
 
 
 def generate_query(state: OverallState) -> QueryGenerationState:
@@ -68,7 +68,7 @@ def generate_query(state: OverallState) -> QueryGenerationState:
     Returns:
         Dictionary with state update, including the list of the generated queries
     """
-    print('> 1st node : Generate Query')
+    print('> Generate Query')
 
     #We configure the model
     llm = ChatGoogleGenerativeAI(
@@ -188,18 +188,60 @@ builder.add_edge("web_research", "reflection")
 
 # ------------- 3rd node : Reflection ---------------
 
-class ReflectionState(TypedDict):
+class ReflectionState(TypedDict): #node-specific state
     is_sufficient: bool
     knowledge_gap: str
     follow_up_queries: Annotated[list, operator.add]
     research_loop_count: int
     number_of_ran_queries: int
 
+class Reflection(BaseModel): #dict to force the output format of the LLLM
+    is_sufficient: bool = Field(
+        description="Whether the provided summaries are sufficient to answer the user's question."
+    )
+    knowledge_gap: str = Field(
+        description="A description of what information is missing or needs clarification."
+    )
+    follow_up_queries: List[str] = Field(
+        description="A list of follow-up queries to address the knowledge gap."
+    )
+
 def reflection(state: OverallState) -> ReflectionState:
-    # ...Some logic to reflect on the results...
-    
-    print('> Reflection node. Entry OverallState =', state)
-    result = {}
+    """
+        LangGraph node that identifies knowledge gaps and generates potential follow-up queries.
+
+        Analyzes the current summary to identify areas for further research and generates
+        potential follow-up queries. Uses structured output to extract
+        the follow-up query in JSON format.
+
+        Args:
+            state: Current graph state containing the running summary and research topic
+            config: Configuration for the runnable, including LLM provider settings
+
+        Returns:
+            Dictionary informing whether the context is sufficient or not, and of potentiel follow-up queries
+    """
+    print('> Reflection')
+
+    state['research_loop_count'] = state.get("research_loop_count", 0) + 1
+
+    #We configure the model
+    llm = ChatGoogleGenerativeAI(
+        model="gemini-2.5-flash", #We use a slightly more intelligent model for the reflection
+        temperature=0.5,
+        max_retries=2,
+        api_key=os.getenv("GOOGLE_API_KEY"),
+    )
+    llm = llm.with_structured_output(Reflection)
+
+    #We adapt the prompt
+    formatted_prompt = reflection_instructions.format(
+        research_topic=get_research_topic(state["messages"]), #the research topic is still in the OverallState
+        summaries="\n\n---\n\n".join(state["web_research_result"]), #and at this stage, all the web research results have also been put in the OverallState and can be aggregated into a summary 
+    )
+
+    result = llm.invoke(formatted_prompt)
+    print(result)
     return {
         "is_sufficient": result.is_sufficient,
         "knowledge_gap": result.knowledge_gap,
