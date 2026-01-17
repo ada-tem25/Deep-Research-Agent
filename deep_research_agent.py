@@ -9,7 +9,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 import operator
 from google.genai import Client
 from dotenv import load_dotenv
-from prompts import (query_writer_instructions, web_searcher_instructions, reflection_instructions)
+from prompts import (query_writer_instructions, web_searcher_instructions, reflection_instructions, answer_instructions)
 from utils import (get_research_topic, resolve_urls, get_citations, insert_citation_markers)
 
 
@@ -107,7 +107,7 @@ def continue_to_web_research(state: QueryGenerationState):
     return [
         Send( #Send allows to send states in parallel to several instances of the same node
             "web_research", 
-            {"search_query": search_query, "id": int(idx)} #WebSearchState format, as required by the next node
+            {"search_query": search_query.query, "id": int(idx)} #WebSearchState format, as required by the next node
         )
         for idx, search_query in enumerate(state["queries"])
     ]
@@ -126,9 +126,6 @@ def web_research(state: WebSearchState) -> OverallState:
     """LangGraph node that performs web research using the native Google 
        Search API tool.
 
-    Executes a web search using the native Google Search API tool in 
-    combination with Gemini 2.0 Flash.
-
     Args:
         state: Current graph state containing the search query and 
                research loop count
@@ -138,7 +135,7 @@ def web_research(state: WebSearchState) -> OverallState:
         Dictionary with state update, including sources_gathered, 
         research_loop_count, and web_research_results
     """
-    print('> Web Research :', state["search_query"].query)
+    print('> Web Research :', state["search_query"])
     
     #We adapt the prompt
     formatted_prompt = web_searcher_instructions.format(
@@ -208,11 +205,7 @@ class Reflection(BaseModel): #dict to force the output format of the LLLM
 
 def reflection(state: OverallState) -> ReflectionState:
     """
-        LangGraph node that identifies knowledge gaps and generates potential follow-up queries.
-
-        Analyzes the current summary to identify areas for further research and generates
-        potential follow-up queries. Uses structured output to extract
-        the follow-up query in JSON format.
+        LangGraph node that identifies knowledge gaps (from the already retrieved info) and generates potential follow-up queries.
 
         Args:
             state: Current graph state containing the running summary and research topic
@@ -241,7 +234,6 @@ def reflection(state: OverallState) -> ReflectionState:
     )
 
     result = llm.invoke(formatted_prompt)
-    print(result)
     return {
         "is_sufficient": result.is_sufficient,
         "knowledge_gap": result.knowledge_gap,
@@ -257,8 +249,21 @@ builder.add_node("reflection", reflection)
 #----------------- 2nd conditional edge : is context sufficient? ----------
 
 def evaluate_research(state: ReflectionState) -> OverallState:
-    # ...Some logic to determine the next step in the research flow...
-    return None
+    
+    max_research_loops = state.get('max_research_loops', 3) #state seems to also contain info of OverallState
+    if (state['is_sufficient'] == True or state['research_loop_count'] > max_research_loops): 
+        if (state['is_sufficient']): print('- No knowledge gap detected.')
+        if (state['research_loop_count'] > max_research_loops): print(f'- Maximum amount of research loops reached : {max_research_loops}.')
+        return "finalize_answer"
+    elif (state['is_sufficient'] == False): 
+        print(f"- Knowledge gaps detected --> {len(state['follow_up_queries'])} additional queries generated!")
+        return [
+            Send( #Send allows to send states in parallel to several instances of the same node
+                "web_research", 
+                {"search_query": query, "id": int(idx) + state["number_of_ran_queries"]} #WebSearchState format, as required by the node
+            )
+            for idx, query in enumerate(state["follow_up_queries"])
+        ]
 
 builder.add_conditional_edges("reflection", evaluate_research, ["web_research", "finalize_answer"])
 
@@ -268,12 +273,46 @@ builder.add_conditional_edges("reflection", evaluate_research, ["web_research", 
 
 
 def finalize_answer(state: OverallState) -> OverallState:
-    # ...Some logic to finalize the research summary...
+    """
+        LangGraph node that finalizes the research summary.
 
-    result = {}
+        Prepares the final output by deduplicating and formatting sources, then
+        combining them with the running summary to create a well-structured
+        research report with proper citations.
+
+        Args:
+            state: Current graph state containing the running summary and sources gathered
+
+        Returns:
+            Dictionary with state update, including running_summary key containing the formatted final summary with sources
+    """
+    print('> Finalizing Answer!')
+    formatted_prompt = answer_instructions.format(
+        current_date=datetime.now().strftime("%B %d, %Y"),
+        research_topic=get_research_topic(state["messages"]),
+        summaries="\n---\n\n".join(state["web_research_result"]),
+    )
+
+    llm = ChatGoogleGenerativeAI(
+        model='gemini-2.5-pro',
+        temperature=0,
+        max_retries=2,
+        api_key=os.getenv("GOOGLE_API_KEY"),
+    )
+    result = llm.invoke(formatted_prompt)
+
+    # Replace the short urls with the original urls and add all used urls to the sources_gathered
+    unique_sources = []
+    for source in state["sources_gathered"]:
+        if source["short_url"] in result.content:
+            result.content = result.content.replace(
+                source["short_url"], source["value"]
+            )
+            unique_sources.append(source)
+
     return {
         "messages": [AIMessage(content=result.content)],
-        #"sources_gathered": unique_sources,
+        "sources_gathered": unique_sources,
     }
 
 builder.add_node("finalize_answer", finalize_answer)
@@ -289,7 +328,7 @@ graph = builder.compile(name="deep-research-agent")
 
 
 if __name__ == "__main__":
-    #graph.get_graph(xray=True).draw_mermaid_png(output_file_path='./agent_graph.png')
+    graph.get_graph(xray=True).draw_mermaid_png(output_file_path='./deep_research_agent_graph.png')
 
     messages = [HumanMessage(content="What are the latest developments in quantum mechanics?")]
     result = graph.invoke({"messages": messages,
