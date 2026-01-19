@@ -3,14 +3,14 @@ from datetime import datetime
 from langgraph.graph import StateGraph, add_messages, START, END
 from langgraph.types import Send
 from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage, AIMessage
-from typing import TypedDict, Annotated, Sequence, List
+from typing import TypedDict, Annotated, Sequence, List, Dict
 from pydantic import BaseModel, Field
 from langchain_google_genai import ChatGoogleGenerativeAI
 import operator
 from google.genai import Client
 from dotenv import load_dotenv
 from prompts import (query_writer_instructions, web_searcher_instructions, reflection_instructions, answer_instructions)
-from utils import (get_research_topic, resolve_urls, get_citations, insert_citation_markers)
+from utils import (get_research_topic, resolve_urls, get_citations, insert_citation_markers, console_parser)
 
 
 
@@ -86,7 +86,7 @@ def generate_query(state: OverallState) -> QueryGenerationState:
         number_queries=state["initial_search_query_count"],
     )
 
-    result = llm.invoke(formatted_prompt) #At this point, result is of format {queries: List(str), rationale: str} (like SearchQueries)
+    result = llm.invoke(formatted_prompt) #At this point, result is of format {queries: List(str), rationale: str} (like SearchQueries) --> Doesn't return metadata, so no token consumption tracking possible!
     queries = [Query(query=q, rationale=result.rationale) for q in result.queries]
     print(f'--> {len(queries)} generated queries!')
     return {"queries": queries} #Returns a QueryGenerationState {queries: List(Query)} with Query being {query: str, rationale: str}
@@ -188,7 +188,7 @@ builder.add_edge("web_research", "reflection")
 class ReflectionState(TypedDict): #node-specific state
     is_sufficient: bool
     knowledge_gap: str
-    follow_up_queries: Annotated[list, operator.add]
+    follow_up_queries: list[str]
     research_loop_count: int
     number_of_ran_queries: int
 
@@ -309,7 +309,7 @@ def finalize_answer(state: OverallState) -> OverallState:
                 source["short_url"], source["value"]
             )
             unique_sources.append(source)
-
+    print(f'- {len(unique_sources)} sources gathered.')
     return {
         "messages": [AIMessage(content=result.content)],
         "sources_gathered": unique_sources,
@@ -328,39 +328,17 @@ graph = builder.compile(name="deep-research-agent")
 
 
 if __name__ == "__main__":
-    graph.get_graph(xray=True).draw_mermaid_png(output_file_path='./deep_research_agent_graph.png')
+    graph.get_graph(xray=True).draw_mermaid_png(output_file_path='./outputs/deep_research_agent_graph.png') #We drawn the graph in the output folder 
+    initial_state = console_parser()
+    result = graph.invoke(initial_state)
+    messages = result.get("messages", [])
+    
+    if messages:
+        final_response = messages[-1].content
 
-    messages = [HumanMessage(content="What are the latest developments in quantum mechanics?")]
-    result = graph.invoke({"messages": messages,
-        "search_query": [],
-        "web_research_result": [],
-        "sources_gathered": [],
-        "initial_search_query_count": 0,
-        "max_research_loops": 2,
-        "research_loop_count": 0
-    })
+        md_path = "./outputs/deep_research_agent_response.md" #We write the response in a markdown file in the output folder
+        with open(md_path, "w", encoding="utf-8") as f:
+            f.write("# Response\n\n")
+            f.write(final_response)
 
-    for m in result["messages"]:
-        m.pretty_print()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-#TO DO à la fin : 
-# - Tester si je peux remplacer le formattage en SearchQueries par QueryGenerationState directement, en mettant une rationale par query ? Ça allègerait la syntaxe un peu lourde du 1er node. 
+        print(f"✅ Response written to {md_path}")

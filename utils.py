@@ -1,5 +1,6 @@
 from typing import Any, Dict, List
 from langchain_core.messages import AnyMessage, AIMessage, HumanMessage
+import argparse
 
 
 def get_research_topic(messages: List[AnyMessage]) -> str:
@@ -165,3 +166,34 @@ def get_citations(response, resolved_urls_map):
                     pass
         citations.append(citation)
     return citations
+
+
+
+def console_parser() -> None: #Parsing parameters to run the program from the terminal
+    """Run the research agent from the command line."""
+    parser = argparse.ArgumentParser(description="Run the LangGraph research agent")
+    parser.add_argument("question", help="Research question")
+    parser.add_argument(
+        "--initial-queries",
+        type=int,
+        default=3,
+        help="Maximum number of initial search queries",
+    )
+    parser.add_argument(
+        "--max-loops",
+        type=int,
+        default=2,
+        help="Maximum number of research loops",
+    )
+    args = parser.parse_args()
+
+    initial_state = {
+        "messages": [HumanMessage(content=args.question)],
+        "search_query": [],
+        "web_research_result": [],
+        "sources_gathered": [],
+        "initial_search_query_count": args.initial_queries,
+        "max_research_loops": args.max_loops,
+        "research_loop_count": 0
+    }
+    return initial_state
